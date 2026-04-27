@@ -1,0 +1,21 @@
+allow:
+  commands:
+    - "python -m pytest*"
+    - "pytest*"
+    - "npm test"
+    - "npm run build"
+ask_before:
+  commands:
+    - "rm *"
+    - "curl *"
+    - "wget *"
+    - "ssh *"
+    - "git push *"
+deny:
+  paths:
+    - ".env"
+    - ".env.*"
+    - "~/.ssh/**"
+  commands:
+    - "sudo *"
+    - "chmod 777 *"
