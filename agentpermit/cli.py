@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -9,6 +11,7 @@ from rich.console import Console
 
 from agentpermit.audit import AuditLog
 from agentpermit.policy import DEFAULT_POLICY_YAML, Policy
+from agentpermit.risk import assess_risk
 
 DIRECTORY_OPTION = typer.Option("--directory", "-d", help="Project directory.")
 
@@ -22,6 +25,10 @@ def _agentpermit_dir(directory: Path) -> Path:
 
 def _policy_path(directory: Path) -> Path:
     return _agentpermit_dir(directory) / "policy.yaml"
+
+
+def _default_audit_path(directory: Path) -> Path:
+    return _agentpermit_dir(directory) / "logs" / "session.jsonl"
 
 
 def _load_policy(directory: Path) -> Policy:
@@ -49,46 +56,84 @@ def init(
 def check(
     ctx: typer.Context,
     directory: Annotated[Path, DIRECTORY_OPTION] = Path("."),
+    as_json: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Print the policy decision for a command without executing it."""
+    """Print the policy decision and risk assessment for a command without executing it."""
     command = list(ctx.args)
     if not command:
         raise typer.BadParameter("missing command after --")
     decision = _load_policy(directory).decide(command)
+    risk = assess_risk(command)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "command": command,
+                    "decision": decision.as_dict(),
+                    "risk": risk.score,
+                    "risk_level": risk.level,
+                    "risk_reasons": risk.reasons,
+                },
+                sort_keys=True,
+            )
+        )
+        return
     console.print(f"{decision.action.upper()}: {' '.join(command)}")
     console.print(decision.reason)
+    console.print(f"Risk: {risk.level} ({risk.score}/100)")
+    for reason in risk.reasons:
+        console.print(f"- {reason}")
 
 
 @app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run(
     ctx: typer.Context,
     directory: Annotated[Path, DIRECTORY_OPTION] = Path("."),
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Approve ask-before commands.")] = False,
+    audit_log: Annotated[
+        Path | None,
+        typer.Option("--audit-log", help="Write JSONL audit entries to this path."),
+    ] = None,
 ) -> None:
-    """Apply policy, run an allowed command, and write an audit entry."""
+    """Apply policy, run approved commands, and write an audit entry."""
     command = list(ctx.args)
     if not command:
         raise typer.BadParameter("missing command after --")
 
     policy = _load_policy(directory)
     decision = policy.decide(command)
-    log = AuditLog(_agentpermit_dir(directory) / "logs" / "session.jsonl")
+    risk = assess_risk(command)
+    log = AuditLog(audit_log or _default_audit_path(directory))
+    cwd = str(directory)
 
     if decision.action == "deny":
-        log.record(command, decision, exit_code=2)
+        log.record(command, decision, exit_code=2, risk=risk, cwd=cwd)
         console.print(f"DENIED: {' '.join(command)}")
         console.print(decision.reason)
         raise typer.Exit(2)
 
-    if decision.action == "ask":
-        log.record(command, decision, exit_code=3)
+    approved = decision.action == "ask" and yes
+    if decision.action == "ask" and not approved:
+        log.record(command, decision, exit_code=3, risk=risk, cwd=cwd)
         console.print(f"APPROVAL REQUIRED: {' '.join(command)}")
         console.print(decision.reason)
+        console.print("Re-run with --yes to approve this command.")
         raise typer.Exit(3)
 
+    started = time.monotonic()
     completed = subprocess.run(command, cwd=directory, text=True, capture_output=True, check=False)
+    duration_ms = round((time.monotonic() - started) * 1000)
     if completed.stdout:
         console.print(completed.stdout, end="")
     if completed.stderr:
         console.print(completed.stderr, end="", style="red")
-    log.record(command, decision, completed.returncode)
+    log.record(
+        command,
+        decision,
+        completed.returncode,
+        risk=risk,
+        cwd=cwd,
+        duration_ms=duration_ms,
+        approved=approved,
+    )
     raise typer.Exit(completed.returncode)
